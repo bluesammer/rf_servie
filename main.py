@@ -126,23 +126,23 @@ def ass_hex_color(rrggbb: str) -> str:
 
 
 def build_sub_style(primary_hex: str) -> str:
-    # KEY FIXES:
-    # - left-anchored (Alignment=4) so the list never shifts when text width changes
-    # - smaller font and outline
-    # - margins place it near center-left of the screen
+    # Keep list fixed in the middle area for ALL events:
+    # - Alignment=5 anchors center
+    # - MarginV gives a stable y offset from true center
+    # Smaller than before.
     return (
         f"Fontname=Arial,"
-        f"Fontsize=18,"
+        f"Fontsize=16,"
         f"PrimaryColour={ass_hex_color(primary_hex)},"
         f"OutlineColour={ass_hex_color('000000')},"
         f"BorderStyle=1,"
-        f"Outline=4,"
+        f"Outline=3,"
         f"Shadow=0,"
         f"Bold=1,"
-        f"Alignment=4,"   # middle-left anchor
-        f"MarginL=60,"    # x position (left padding)
+        f"Alignment=5,"
+        f"MarginL=0,"
         f"MarginR=0,"
-        f"MarginV=120"    # y position (moves block down from center)
+        f"MarginV=130"
     )
 
 
@@ -159,7 +159,7 @@ def clamp_time(t: float, lo: float, hi: float) -> float:
 
 
 def build_progress_list(slots: int, filled: Dict[int, str]) -> str:
-    # Always exactly N lines, so the block height never changes.
+    # Always exactly N lines so block height stays constant.
     lines = []
     for i in range(1, slots + 1):
         if i in filled and filled[i]:
@@ -174,7 +174,7 @@ class ProcessReq(BaseModel):
     slots: int = 5
     target_fps: int = 30
     sub_primary_hex: str = "FFFF00"
-    logo_enabled: bool = False
+    logo_enabled: bool = True
     logo_url: Optional[str] = None
     output_prefix: str = "ReelFive_"
 
@@ -252,21 +252,20 @@ def process(req: ProcessReq):
 
     overlay.sort(key=lambda x: x["time"])
 
-    # Progressive list:
-    # 0..t1 shows 1..N blank
-    # t1..t2 shows 1 filled, rest blank
-    # ...
+    # Build progressive list subtitles. Always same position, same line count.
     srt_path = os.path.join(work, "subtitles.srt")
     min_chunk = 0.60
 
     filled: Dict[int, str] = {}
     events = []
 
+    # Start with blanks from 0 to first timestamp
     first_time = overlay[0]["time"]
     if first_time < min_chunk:
         first_time = min_chunk
     events.append({"start": 0.0, "end": first_time, "text": build_progress_list(slots, filled)})
 
+    # Then update list at each word time
     for i, item in enumerate(overlay):
         filled[item["slot"]] = item["word"]
 
@@ -296,11 +295,20 @@ def process(req: ProcessReq):
 
     sub_style = build_sub_style(req.sub_primary_hex)
 
+    # Logo back on again.
+    # If logo_url not provided, try local /app/logo.png
     use_logo = False
     logo_path = os.path.join(work, "logo.png")
-    if req.logo_enabled and req.logo_url:
-        download_file(req.logo_url, logo_path)
-        use_logo = os.path.exists(logo_path)
+
+    if req.logo_enabled:
+        if req.logo_url:
+            download_file(req.logo_url, logo_path)
+            use_logo = os.path.exists(logo_path)
+        else:
+            local_logo = "/app/logo.png"
+            if os.path.exists(local_logo):
+                shutil.copy(local_logo, logo_path)
+                use_logo = os.path.exists(logo_path)
 
     out_name = f"{req.output_prefix}{uuid.uuid4().hex}.mp4"
     out_path = os.path.join(work, out_name)
@@ -308,12 +316,15 @@ def process(req: ProcessReq):
     srt_f = esc_ff_filter(srt_path)
     logo_f = esc_ff_filter(logo_path)
 
+    # Subtitle filter (always same style, same placement)
+    sub_filter = f"subtitles='{srt_f}':force_style='{sub_style}'"
+
     if use_logo:
+        # Keep logo top-right with padding
         vf = (
-            f"[0:v]fps={int(req.target_fps)},"
-            f"subtitles='{srt_f}':force_style='{sub_style}'[v];"
-            f"movie='{logo_f}',scale=200:-1[logo];"
-            f"[v][logo]overlay=30:H-h-30:format=auto"
+            f"[0:v]fps={int(req.target_fps)},{sub_filter}[v];"
+            f"movie='{logo_f}',scale=160:-1[logo];"
+            f"[v][logo]overlay=W-w-30:30:format=auto"
         )
         cmd = [
             "ffmpeg", "-y",
@@ -327,7 +338,7 @@ def process(req: ProcessReq):
             out_path
         ]
     else:
-        vf = f"fps={int(req.target_fps)},subtitles='{srt_f}':force_style='{sub_style}'"
+        vf = f"fps={int(req.target_fps)},{sub_filter}"
         cmd = [
             "ffmpeg", "-y",
             "-i", in_path,
