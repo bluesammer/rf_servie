@@ -1,0 +1,20 @@
+{
+  "stopwords": [
+    "is","am","are","was","were","be","been","being",
+    "to","and","of","the","a","an","for","in","on","at","by","with",
+    "i","me","you","your","he","she","it","we","us","they","them","our","their","his","her","its",
+    "oh","yeah","okay","ok","hey","uh","um","hmm","huh","ah","uhh","erm","like","so","well",
+    "do","did","does","done","will","would","shall","should","might","must",
+    "if","but","because","from","out","up","down","off","into","onto","then","than",
+    "this","these","those","some","any","each","every","much","many","more","most","few","less","lot","lots",
+    "where","when","why","how","what","which","who","whom","there","here","now","today","tomorrow","yesterday",
+    "thing","stuff","something","someone","anything","everything","nothing",
+    "come","go","got","get","gotten","going","say","said","make","made","know","think","thought","see","look"
+  ],
+  "stop_patterns": [
+    "^i['’]m$",
+    "^i['’]ll$",
+    ".*['’]s$",
+    "account[s]?$"
+  ]
+}
