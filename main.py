@@ -33,9 +33,9 @@ def env_bool(name: str, default: bool = False) -> bool:
     if v is None:
         return default
     s = v.strip().lower()
-    if s in ("1","true","t","yes","y","on"):
+    if s in ("1", "true", "t", "yes", "y", "on"):
         return True
-    if s in ("0","false","f","no","n","off"):
+    if s in ("0", "false", "f", "no", "n", "off"):
         return False
     return default
 
@@ -56,12 +56,12 @@ def env_int(name: str, default: int) -> int:
 RUN_ENV = env_str("RUN_ENV", "railway" if os.getenv("RAILWAY_ENVIRONMENT") else "local")
 BASE_DIR = "/tmp" if RUN_ENV == "railway" else os.getcwd()
 
-VIDEO_SOURCE = env_str("VIDEO_SOURCE", "local").lower()  # local | url
+VIDEO_SOURCE = env_str("VIDEO_SOURCE", "url").lower()  # local | url
 VIDEO_NAME = env_str("VIDEO_NAME", "tiktest4.mp4")
 VIDEO_URL = env_str("VIDEO_URL", "")
 
 LOGO_ENABLED = env_bool("LOGO_ENABLED", False)
-LOGO_SOURCE = env_str("LOGO_SOURCE", "local").lower()    # local | url
+LOGO_SOURCE = env_str("LOGO_SOURCE", "local").lower()  # local | url
 LOGO_NAME = env_str("LOGO_NAME", "logo.png")
 LOGO_URL = env_str("LOGO_URL", "")
 
@@ -73,13 +73,20 @@ SUB_PRIMARY_HEX = env_str("SUB_PRIMARY_HEX", "FFFF00")
 
 OUTPUT_PREFIX = env_str("OUTPUT_PREFIX", "ReelFive_")
 
+# ---------- IDLE GUARD ----------
+# Railway runs main.py on container start.
+# If you do not provide VIDEO_URL, exit cleanly so it does not restart-loop.
+
+if VIDEO_SOURCE == "url" and not VIDEO_URL:
+    print("No VIDEO_URL provided. Service idle.")
+    raise SystemExit(0)
+
 # ---------- PATHS ----------
 
 video_path = os.path.join(BASE_DIR, VIDEO_NAME)
 logo_path = os.path.join(BASE_DIR, LOGO_NAME)
 stopwords_json_path = os.path.join(BASE_DIR, STOPWORDS_NAME)
 
-# Output name derived from input name
 out_name = f"{OUTPUT_PREFIX}{Path(VIDEO_NAME).stem}.mp4"
 srt_name = "subtitles.srt"
 
@@ -115,7 +122,10 @@ if not os.path.exists(video_path):
 # ---------- ENSURE LOGO EXISTS IF NEEDED ----------
 
 if LOGO_ENABLED and LOGO_SOURCE == "url":
-    download_file(LOGO_URL, logo_path)
+    if not LOGO_URL:
+        print("Logo enabled but LOGO_URL missing, continuing without logo")
+    else:
+        download_file(LOGO_URL, logo_path)
 
 # ---------- CHECK FFMPEG ----------
 
@@ -123,20 +133,22 @@ if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
     raise SystemExit("FFmpeg/FFprobe not installed")
 
 # ---------- LOAD SPACY ----------
+# Do not download here. Dockerfile installs the model.
 
 try:
     nlp = spacy.load("en_core_web_sm")
-except:
-    import spacy.cli
-    spacy.cli.download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+except Exception as e:
+    print("Failed to load spaCy model en_core_web_sm.")
+    print("Fix: install the model in Dockerfile using the .whl URL.")
+    print("Error:", str(e))
+    raise SystemExit(1)
 
 # ---------- STYLE ----------
 
 def ass_hex_color(rrggbb: str) -> str:
     s = (rrggbb or "").strip().lstrip("#")
     if len(s) == 3:
-        s = "".join([c*2 for c in s])
+        s = "".join([c * 2 for c in s])
     if len(s) != 6 or any(c not in "0123456789abcdefABCDEF" for c in s):
         raise SystemExit("SUB_PRIMARY_HEX must be like FFFF00")
     r = s[0:2]
@@ -161,8 +173,8 @@ SUB_STYLE = build_sub_style()
 
 def get_duration(path: str) -> float:
     r = subprocess.run(
-        ["ffprobe","-v","error","-show_entries","format=duration",
-         "-of","default=noprint_wrappers=1:nokey=1", path],
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
         capture_output=True, text=True
     )
     out = (r.stdout or "").strip()
@@ -193,8 +205,6 @@ print("Base dir:", BASE_DIR)
 print("Video source:", VIDEO_SOURCE)
 print("Video path:", video_path)
 print("Logo enabled:", LOGO_ENABLED)
-print("Logo source:", LOGO_SOURCE)
-print("Logo path:", logo_path)
 print("Output:", output_path)
 
 # ---------- DURATION ----------
@@ -272,7 +282,6 @@ print("Wrote SRT:", srt_path)
 # ---------- FFMPEG BURN ----------
 
 use_logo = LOGO_ENABLED and os.path.exists(logo_path)
-
 if LOGO_ENABLED and not os.path.exists(logo_path):
     print("Logo enabled but logo file missing, continuing without logo")
 
