@@ -19,7 +19,7 @@ import re
 import urllib.request
 import uuid
 import threading
-from typing import Optional
+from typing import Optional, List, Dict
 
 import whisper
 import spacy
@@ -115,7 +115,6 @@ def normalize_word(w: str) -> str:
 
 
 def strip_ass_tags(s: str) -> str:
-    # removes patterns like {\pos(40,90)} or any {\...}
     return re.sub(r"\{\\[^}]*\}", "", s or "").strip()
 
 
@@ -132,26 +131,44 @@ def ass_hex_color(rrggbb: str) -> str:
 
 
 def build_sub_style(primary_hex: str) -> str:
-    # Centered, larger, bold, thick outline
+    # Centered list, readable size, thick outline
     return (
         f"Fontname=Arial,"
-        f"Fontsize=34,"
+        f"Fontsize=22,"
         f"PrimaryColour={ass_hex_color(primary_hex)},"
         f"OutlineColour={ass_hex_color('000000')},"
         f"BorderStyle=1,"
-        f"Outline=5,"
+        f"Outline=6,"
         f"Shadow=0,"
         f"Bold=1,"
-        f"Alignment=5,"   # center of screen
+        f"Alignment=5,"     # center of screen
         f"MarginL=0,"
         f"MarginR=0,"
-        f"MarginV=0"
+        f"MarginV=80"       # push slightly upward from dead center
     )
 
 
 def esc_ff_filter(s: str) -> str:
-    # ffmpeg filter strings break on backslash, colon, and single quote
     return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def clamp_time(t: float, lo: float, hi: float) -> float:
+    if t < lo:
+        return lo
+    if t > hi:
+        return hi
+    return t
+
+
+def build_progress_list(slots: int, filled: Dict[int, str]) -> str:
+    # filled maps slot_index (1..slots) -> word
+    lines = []
+    for i in range(1, slots + 1):
+        if i in filled and filled[i]:
+            lines.append(f"{i}. {filled[i]}")
+        else:
+            lines.append(f"{i}.")
+    return "\n".join(lines)
 
 
 # ---------- API ----------
@@ -177,6 +194,12 @@ def process(req: ProcessReq):
     if nlp is None:
         raise HTTPException(status_code=500, detail="spaCy not loaded")
 
+    slots = int(req.slots)
+    if slots < 1:
+        raise HTTPException(status_code=400, detail="slots must be >= 1")
+    if slots > 10:
+        raise HTTPException(status_code=400, detail="slots too high, max 10")
+
     work = f"/tmp/work_{uuid.uuid4().hex}"
     os.makedirs(work, exist_ok=True)
 
@@ -197,7 +220,7 @@ def process(req: ProcessReq):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"whisper transcribe failed: {e}")
 
-    words = []
+    words: List[Dict] = []
     for seg in result.get("segments", []):
         for w in seg.get("words", []):
             token = (w.get("word") or "").strip()
@@ -212,10 +235,10 @@ def process(req: ProcessReq):
         words[i]["pos"] = doc[0].pos_ if len(doc) else "X"
 
     preferred = [w for w in words if w["pos"] in ("NOUN", "PROPN")]
-    seg_len = duration / max(int(req.slots), 1)
+    seg_len = duration / max(slots, 1)
 
     overlay = []
-    for i in range(int(req.slots)):
+    for i in range(slots):
         seg_start = i * seg_len
         seg_end = seg_start + seg_len
         seg_words = [w for w in preferred if seg_start <= w["start"] < seg_end]
@@ -223,27 +246,60 @@ def process(req: ProcessReq):
 
         clean = normalize_word(chosen["word"]).upper()
         final_word = clean if clean else (chosen["word"] or "").strip().upper()
+        final_word = strip_ass_tags(final_word)
 
-        overlay.append({"slot": i + 1, "word": final_word, "time": float(chosen["start"])})
+        t = float(chosen["start"])
+        t = clamp_time(t, 0.0, max(0.0, duration - 0.01))
 
-    # SRT with sensible durations per line
+        overlay.append({"slot": i + 1, "word": final_word, "time": t})
+
+    # Sort by time to avoid weird ordering if timestamps collide
+    overlay.sort(key=lambda x: x["time"])
+
+    # Build progressive list subtitles:
+    # 0..t1 shows 1..5 with blanks
+    # t1..t2 shows 1 filled, rest blank
+    # ...
+    # last..duration shows all filled
     srt_path = os.path.join(work, "subtitles.srt")
+    min_chunk = 0.60
+
+    filled: Dict[int, str] = {}
+    events = []
+
+    # initial event
+    first_time = overlay[0]["time"]
+    if first_time < min_chunk:
+        first_time = min_chunk
+    events.append({"start": 0.0, "end": first_time, "text": build_progress_list(slots, filled)})
+
+    # progressive updates
+    for i, item in enumerate(overlay):
+        filled[item["slot"]] = item["word"]
+
+        start = item["time"]
+        if i < len(overlay) - 1:
+            end = overlay[i + 1]["time"]
+        else:
+            end = duration
+
+        if end - start < min_chunk:
+            end = min(duration, start + min_chunk)
+
+        events.append({"start": start, "end": end, "text": build_progress_list(slots, filled)})
+
+    # Write SRT
     with open(srt_path, "w", encoding="utf-8") as f:
-        for idx, item in enumerate(overlay, start=1):
-            start = max(0.0, float(item["time"]))
-            if idx < len(overlay):
-                end = float(overlay[idx]["time"])
-            else:
-                end = duration
+        for idx, ev in enumerate(events, start=1):
+            start = clamp_time(ev["start"], 0.0, duration)
+            end = clamp_time(ev["end"], 0.0, duration)
+            if end <= start:
+                continue
 
-            end = min(end, start + 2.0)
-            if end - start < 0.7:
-                end = min(duration, start + 0.7)
-
-            line = strip_ass_tags(f"{item['slot']}. {item['word']}")
+            text = strip_ass_tags(ev["text"])
             f.write(f"{idx}\n")
             f.write(f"{format_time(start)} --> {format_time(end)}\n")
-            f.write(f"{line}\n\n")
+            f.write(f"{text}\n\n")
 
     sub_style = build_sub_style(req.sub_primary_hex)
 
