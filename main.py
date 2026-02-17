@@ -11,7 +11,7 @@
 
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # CPU only
 
 import shutil
 import subprocess
@@ -19,6 +19,8 @@ import re
 import urllib.request
 from pathlib import Path
 from typing import Optional
+import uuid
+import threading
 
 import whisper
 import spacy
@@ -28,15 +30,22 @@ from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-# ---------- LOAD MODELS ON STARTUP ----------
-
-try:
-    nlp = spacy.load("en_core_web_sm")
-except Exception as e:
-    raise RuntimeError(f"spaCy model load failed: {e}")
-
-# Whisper loads on first request, keeps in memory after
+# ---------- GLOBALS ----------
+nlp = None
 _whisper_model = None
+
+# Whisper transcribe is not thread-safe due to KV-cache forward hooks.
+# Guard transcribe with a single lock shared across requests.
+TRANSCRIBE_LOCK = threading.Lock()
+
+# ---------- STARTUP ----------
+@app.on_event("startup")
+def _startup():
+    global nlp
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except Exception as e:
+        raise RuntimeError(f"spaCy model load failed: {e}")
 
 def get_whisper_model():
     global _whisper_model
@@ -45,6 +54,9 @@ def get_whisper_model():
     return _whisper_model
 
 # ---------- HELPERS ----------
+def ensure_tools():
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        raise HTTPException(status_code=500, detail="ffmpeg or ffprobe missing")
 
 def download_file(url: str, dest_path: str):
     if not url:
@@ -52,8 +64,9 @@ def download_file(url: str, dest_path: str):
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     try:
         with urllib.request.urlopen(url) as resp:
-            if getattr(resp, "status", 200) != 200:
-                raise HTTPException(status_code=400, detail=f"download failed http {resp.status}")
+            status = getattr(resp, "status", 200)
+            if status != 200:
+                raise HTTPException(status_code=400, detail=f"download failed http {status}")
             data = resp.read()
         with open(dest_path, "wb") as f:
             f.write(data)
@@ -62,16 +75,17 @@ def download_file(url: str, dest_path: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"download failed: {e}")
 
-def get_duration(path: str) -> float:
+def get_duration_or_zero(path: str) -> float:
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", path],
         capture_output=True, text=True
     )
     out = (r.stdout or "").strip()
-    if not out:
-        raise HTTPException(status_code=500, detail="ffprobe failed")
-    return float(out)
+    try:
+        return float(out)
+    except Exception:
+        return 0.0
 
 def format_time(seconds: float) -> str:
     h = int(seconds // 3600)
@@ -111,21 +125,18 @@ def build_sub_style(primary_hex: str) -> str:
         f"MarginV=50"
     )
 
-def ensure_tools():
-    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        raise HTTPException(status_code=500, detail="ffmpeg or ffprobe missing")
+def esc_filter_path(p: str) -> str:
+    # Safer for ffmpeg filter strings. Keep it simple for Linux paths.
+    return p.replace("\\", "\\\\").replace(":", "\\:")
 
 # ---------- API ----------
-
 class ProcessReq(BaseModel):
     video_url: str = Field(..., description="Direct public mp4 url")
     slots: int = 5
     target_fps: int = 30
     sub_primary_hex: str = "FFFF00"
-
     logo_enabled: bool = False
     logo_url: Optional[str] = None
-
     output_prefix: str = "ReelFive_"
 
 @app.get("/health")
@@ -136,21 +147,31 @@ def health():
 def process(req: ProcessReq):
     ensure_tools()
 
-    work = "/tmp/work"
+    if nlp is None:
+        raise HTTPException(status_code=500, detail="spaCy not loaded")
+
+    # Unique work dir per request to avoid collisions.
+    work = f"/tmp/work_{uuid.uuid4().hex}"
     os.makedirs(work, exist_ok=True)
 
-    in_name = "input.mp4"
-    in_path = os.path.join(work, in_name)
-
+    in_path = os.path.join(work, "input.mp4")
     download_file(req.video_url, in_path)
 
     if not os.path.exists(in_path):
         raise HTTPException(status_code=400, detail="video download failed")
 
-    duration = get_duration(in_path)
+    duration = get_duration_or_zero(in_path)
+    if duration <= 0:
+        raise HTTPException(status_code=400, detail="ffprobe duration failed")
 
     model = get_whisper_model()
-    result = model.transcribe(in_path, word_timestamps=True, fp16=False)
+
+    # Critical fix: serialize transcribe across requests.
+    with TRANSCRIBE_LOCK:
+        try:
+            result = model.transcribe(in_path, word_timestamps=True, fp16=False)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"whisper transcribe failed: {e}")
 
     words = []
     for seg in result.get("segments", []):
@@ -167,10 +188,10 @@ def process(req: ProcessReq):
         words[i]["pos"] = doc[0].pos_ if len(doc) else "X"
 
     preferred = [w for w in words if w["pos"] in ("NOUN", "PROPN")]
-    seg_len = duration / max(req.slots, 1)
+    seg_len = duration / max(int(req.slots), 1)
 
     overlay = []
-    for i in range(req.slots):
+    for i in range(int(req.slots)):
         seg_start = i * seg_len
         seg_end = seg_start + seg_len
         seg_words = [w for w in preferred if seg_start <= w["start"] < seg_end]
@@ -183,12 +204,10 @@ def process(req: ProcessReq):
 
     srt_path = os.path.join(work, "subtitles.srt")
     with open(srt_path, "w", encoding="utf-8") as f:
-        idx = 1
-        for item in overlay:
+        for idx, item in enumerate(overlay, start=1):
             f.write(f"{idx}\n")
             f.write(f"{format_time(item['time'])} --> {format_time(duration)}\n")
             f.write(f"{item['slot']}. {item['word']}\n\n")
-            idx += 1
 
     sub_style = build_sub_style(req.sub_primary_hex)
 
@@ -198,40 +217,53 @@ def process(req: ProcessReq):
         download_file(req.logo_url, logo_path)
         use_logo = os.path.exists(logo_path)
 
-    out_name = f"{req.output_prefix}{Path(in_name).stem}.mp4"
+    out_name = f"{req.output_prefix}{Path('input').stem}.mp4"
     out_path = os.path.join(work, out_name)
+
+    srt_f = esc_filter_path(srt_path)
+    logo_f = esc_filter_path(logo_path)
 
     if use_logo:
         vf = (
-            f"[0:v]fps={req.target_fps},subtitles='{srt_path}':force_style='{sub_style}'[v];"
-            f"movie='{logo_path}',scale=200:-1[logo];"
+            f"[0:v]fps={int(req.target_fps)},"
+            f"subtitles='{srt_f}':force_style='{sub_style}'[v];"
+            f"movie='{logo_f}',scale=200:-1[logo];"
             f"[v][logo]overlay=30:H-h-30:format=auto"
         )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", in_path,
+            "-filter_complex", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-r", str(int(req.target_fps)),
+            "-c:a", "aac", "-b:a", "128k",
+            out_path
+        ]
     else:
-        vf = f"fps={req.target_fps},subtitles='{srt_path}':force_style='{sub_style}'"
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", in_path,
-        "-filter_complex", vf,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-r", str(req.target_fps),
-        "-c:a", "aac", "-b:a", "128k",
-        out_path
-    ]
+        vf = (
+            f"fps={int(req.target_fps)},"
+            f"subtitles='{srt_f}':force_style='{sub_style}'"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", in_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-r", str(int(req.target_fps)),
+            "-c:a", "aac", "-b:a", "128k",
+            out_path
+        ]
 
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         tail = (p.stderr or "")[-2000:]
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {tail}")
 
-    return FileResponse(
-        out_path,
-        media_type="video/mp4",
-        filename=out_name
-    )
+    return FileResponse(out_path, media_type="video/mp4", filename=out_name)
 
 
 # In[ ]:
