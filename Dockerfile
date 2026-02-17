@@ -18,15 +18,16 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir --upgrade \
     pip==24.2 \
-    setuptools==81.0.0 \
+    setuptools==69.5.1 \
     wheel==0.44.0
 
 RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir --no-build-isolation openai-whisper==20231117
 
 RUN python -m spacy download en_core_web_sm
 
 COPY . .
 
 EXPOSE 8000
-
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
