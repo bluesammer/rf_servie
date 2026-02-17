@@ -34,6 +34,25 @@ nlp = None
 _whisper_model = None
 TRANSCRIBE_LOCK = threading.Lock()
 
+# ---------- TUNING (change these only) ----------
+# These positions assume a vertical 1080x1920 video.
+# If your video differs, tweak LIST_X / WORD_X / LIST_Y.
+PLAY_RES_X = 1080
+PLAY_RES_Y = 1920
+
+LIST_Y = 820          # vertical anchor for the list (middle area)
+LIST_X = 140          # x for the numbers column
+WORD_X = 250          # x for the words column
+
+FONT_SIZE = 26        # smaller font
+OUTLINE = 5           # thick outline, but not huge
+LINE_GAP = 8          # extra spacing between lines
+
+LOGO_SCALE_W = 160    # logo width
+LOGO_PAD_X = 30
+LOGO_PAD_Y = 30
+# ----------------------------------------------
+
 
 @app.on_event("startup")
 def _startup():
@@ -91,17 +110,6 @@ def get_duration_or_zero(path: str) -> float:
         return 0.0
 
 
-def format_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds % 1) * 1000))
-    if ms == 1000:
-        s += 1
-        ms = 0
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
 def normalize_word(w: str) -> str:
     w = (w or "").strip().lower()
     w = w.replace("’", "'")
@@ -113,41 +121,10 @@ def strip_ass_tags(s: str) -> str:
     return re.sub(r"\{\\[^}]*\}", "", s or "").strip()
 
 
-def ass_hex_color(rrggbb: str) -> str:
-    s = (rrggbb or "").strip().lstrip("#")
-    if len(s) == 3:
-        s = "".join([c * 2 for c in s])
-    if len(s) != 6 or any(c not in "0123456789abcdefABCDEF" for c in s):
-        raise HTTPException(status_code=400, detail="sub_primary_hex must be like FFFF00")
-    r = s[0:2]
-    g = s[2:4]
-    b = s[4:6]
-    return f"&H{b}{g}{r}"
-
-
-def build_sub_style(primary_hex: str) -> str:
-    # Keep list fixed in the middle area for ALL events:
-    # - Alignment=5 anchors center
-    # - MarginV gives a stable y offset from true center
-    # Smaller than before.
-    return (
-        f"Fontname=Arial,"
-        f"Fontsize=16,"
-        f"PrimaryColour={ass_hex_color(primary_hex)},"
-        f"OutlineColour={ass_hex_color('000000')},"
-        f"BorderStyle=1,"
-        f"Outline=3,"
-        f"Shadow=0,"
-        f"Bold=1,"
-        f"Alignment=5,"
-        f"MarginL=0,"
-        f"MarginR=0,"
-        f"MarginV=130"
-    )
-
-
-def esc_ff_filter(s: str) -> str:
-    return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+def esc_ass_text(s: str) -> str:
+    # Escape ASS special chars
+    s = (s or "").replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    return s
 
 
 def clamp_time(t: float, lo: float, hi: float) -> float:
@@ -158,15 +135,85 @@ def clamp_time(t: float, lo: float, hi: float) -> float:
     return t
 
 
-def build_progress_list(slots: int, filled: Dict[int, str]) -> str:
-    # Always exactly N lines so block height stays constant.
-    lines = []
+def ass_time(t: float) -> str:
+    # ASS time: H:MM:SS.CS (centiseconds)
+    if t < 0:
+        t = 0.0
+    cs = int(round(t * 100.0))
+    h = cs // 360000
+    cs -= h * 360000
+    m = cs // 6000
+    cs -= m * 6000
+    s = cs // 100
+    cs -= s * 100
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def esc_ff_filter(s: str) -> str:
+    return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def build_numbers_block(slots: int) -> str:
+    # Fixed column, never changes, never moves
+    return "\\N".join([f"{i}." for i in range(1, slots + 1)])
+
+
+def build_words_block(slots: int, filled: Dict[int, str]) -> str:
+    # Fixed number of lines, never changes height
+    out = []
     for i in range(1, slots + 1):
-        if i in filled and filled[i]:
-            lines.append(f"{i}. {filled[i]}")
-        else:
-            lines.append(f"{i}.")
-    return "\n".join(lines)
+        out.append(esc_ass_text(filled.get(i, "")))
+    return "\\N".join(out)
+
+
+def write_ass(path: str, duration: float, slots: int, events_words: List[Dict], primary_hex: str):
+    # Yellow = &H0000FFFF (AABBGGRR)
+    # Black outline = &H00000000
+    primary = "&H0000FFFF" if (primary_hex or "").upper() == "FFFF00" else "&H0000FFFF"
+
+    # If you want other colors later, map primary_hex to ASS here.
+    # Keep it simple for now: always yellow.
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {PLAY_RES_X}
+PlayResY: {PLAY_RES_Y}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: NUM,Arial,{FONT_SIZE},{primary},&H00000000,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,{OUTLINE},0,4,0,0,0,0
+Style: WORD,Arial,{FONT_SIZE},{primary},&H00000000,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,{OUTLINE},0,4,0,0,0,0
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    # Numbers event runs the whole video, fixed position.
+    numbers_text = build_numbers_block(slots)
+    num_event = (
+        f"Dialogue: 0,{ass_time(0.0)},{ass_time(duration)},NUM,,0,0,0,,"
+        f"{{\\pos({LIST_X},{LIST_Y})\\an4\\fsp0}}{numbers_text}\n"
+    )
+
+    # Words events update over time, fixed position, fixed left alignment.
+    # This keeps it in the middle area and stops the “moving”.
+    word_lines = []
+    for ev in events_words:
+        start = clamp_time(ev["start"], 0.0, duration)
+        end = clamp_time(ev["end"], 0.0, duration)
+        if end <= start:
+            continue
+        txt = ev["text"]
+        word_lines.append(
+            f"Dialogue: 1,{ass_time(start)},{ass_time(end)},WORD,,0,0,0,,"
+            f"{{\\pos({WORD_X},{LIST_Y})\\an4\\fsp0}}{txt}\n"
+        )
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write(num_event)
+        for line in word_lines:
+            f.write(line)
 
 
 class ProcessReq(BaseModel):
@@ -174,8 +221,10 @@ class ProcessReq(BaseModel):
     slots: int = 5
     target_fps: int = 30
     sub_primary_hex: str = "FFFF00"
+
     logo_enabled: bool = True
     logo_url: Optional[str] = None
+
     output_prefix: str = "ReelFive_"
 
 
@@ -252,20 +301,23 @@ def process(req: ProcessReq):
 
     overlay.sort(key=lambda x: x["time"])
 
-    # Build progressive list subtitles. Always same position, same line count.
-    srt_path = os.path.join(work, "subtitles.srt")
+    # Build word events (only the word column changes).
+    # Numbers column is one fixed event for the full duration.
     min_chunk = 0.60
-
     filled: Dict[int, str] = {}
-    events = []
+    events_words = []
 
-    # Start with blanks from 0 to first timestamp
+    # Start blank words until first word time
     first_time = overlay[0]["time"]
     if first_time < min_chunk:
         first_time = min_chunk
-    events.append({"start": 0.0, "end": first_time, "text": build_progress_list(slots, filled)})
 
-    # Then update list at each word time
+    events_words.append({
+        "start": 0.0,
+        "end": first_time,
+        "text": build_words_block(slots, filled)
+    })
+
     for i, item in enumerate(overlay):
         filled[item["slot"]] = item["word"]
 
@@ -278,28 +330,19 @@ def process(req: ProcessReq):
         if end - start < min_chunk:
             end = min(duration, start + min_chunk)
 
-        events.append({"start": start, "end": end, "text": build_progress_list(slots, filled)})
+        events_words.append({
+            "start": start,
+            "end": end,
+            "text": build_words_block(slots, filled)
+        })
 
-    with open(srt_path, "w", encoding="utf-8") as f:
-        idx = 1
-        for ev in events:
-            start = clamp_time(ev["start"], 0.0, duration)
-            end = clamp_time(ev["end"], 0.0, duration)
-            if end <= start:
-                continue
-            text = strip_ass_tags(ev["text"])
-            f.write(f"{idx}\n")
-            f.write(f"{format_time(start)} --> {format_time(end)}\n")
-            f.write(f"{text}\n\n")
-            idx += 1
+    # Write ASS subtitles (fixed position, no moving)
+    ass_path = os.path.join(work, "list.ass")
+    write_ass(ass_path, duration, slots, events_words, req.sub_primary_hex)
 
-    sub_style = build_sub_style(req.sub_primary_hex)
-
-    # Logo back on again.
-    # If logo_url not provided, try local /app/logo.png
+    # Logo overlay
     use_logo = False
     logo_path = os.path.join(work, "logo.png")
-
     if req.logo_enabled:
         if req.logo_url:
             download_file(req.logo_url, logo_path)
@@ -313,18 +356,18 @@ def process(req: ProcessReq):
     out_name = f"{req.output_prefix}{uuid.uuid4().hex}.mp4"
     out_path = os.path.join(work, out_name)
 
-    srt_f = esc_ff_filter(srt_path)
+    ass_f = esc_ff_filter(ass_path)
     logo_f = esc_ff_filter(logo_path)
 
-    # Subtitle filter (always same style, same placement)
-    sub_filter = f"subtitles='{srt_f}':force_style='{sub_style}'"
+    # Burn ASS subtitles
+    sub_filter = f"subtitles='{ass_f}'"
+    fps_filter = f"fps={int(req.target_fps)}"
 
     if use_logo:
-        # Keep logo top-right with padding
         vf = (
-            f"[0:v]fps={int(req.target_fps)},{sub_filter}[v];"
-            f"movie='{logo_f}',scale=160:-1[logo];"
-            f"[v][logo]overlay=W-w-30:30:format=auto"
+            f"[0:v]{fps_filter},{sub_filter}[v];"
+            f"movie='{logo_f}',scale={LOGO_SCALE_W}:-1[logo];"
+            f"[v][logo]overlay=W-w-{LOGO_PAD_X}:{LOGO_PAD_Y}:format=auto"
         )
         cmd = [
             "ffmpeg", "-y",
@@ -338,7 +381,7 @@ def process(req: ProcessReq):
             out_path
         ]
     else:
-        vf = f"fps={int(req.target_fps)},{sub_filter}"
+        vf = f"{fps_filter},{sub_filter}"
         cmd = [
             "ffmpeg", "-y",
             "-i", in_path,
@@ -353,7 +396,7 @@ def process(req: ProcessReq):
 
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
-        tail = (p.stderr or "")[-2000:]
+        tail = (p.stderr or "")[-2500:]
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {tail}")
 
     if not os.path.exists(out_path):
