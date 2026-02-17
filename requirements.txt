@@ -7,8 +7,8 @@ tqdm==4.66.4
 regex==2024.11.6
 requests==2.32.3
 
---index-url https://download.pytorch.org/whl/cpu
 torch==2.1.2+cpu
 torchaudio==2.1.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 openai-whisper==20231117
