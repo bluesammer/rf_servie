@@ -2,9 +2,8 @@ pip==24.2
 setuptools==75.6.0
 wheel==0.44.0
 
-openai-whisper==20231117
+openai-whisper @ git+https://github.com/openai/whisper.git@v20231117
 spacy==3.7.4
-torch==2.2.2
 numpy==1.26.4
 tqdm==4.66.4
 regex==2024.11.6
