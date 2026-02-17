@@ -44,7 +44,7 @@ LIST_Y = 820          # vertical anchor for the list (middle area)
 LIST_X = 140          # x for the numbers column
 WORD_X = 250          # x for the words column
 
-FONT_SIZE = 32        # smaller font
+FONT_SIZE = 45        # smaller font
 OUTLINE = 5           # thick outline, but not huge
 LINE_GAP = 8          # extra spacing between lines
 
