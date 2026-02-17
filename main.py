@@ -91,17 +91,6 @@ def get_duration_or_zero(path: str) -> float:
         return 0.0
 
 
-def format_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds % 1) * 1000))
-    if ms == 1000:
-        s += 1
-        ms = 0
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
 def normalize_word(w: str) -> str:
     w = (w or "").strip().lower()
     w = w.replace("’", "'")
@@ -109,7 +98,26 @@ def normalize_word(w: str) -> str:
     return w
 
 
-def ass_hex_color(rrggbb: str) -> str:
+def esc_ff_filter(s: str) -> str:
+    return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def format_ass_time(seconds: float) -> str:
+    # ASS uses H:MM:SS.cc (centiseconds)
+    if seconds < 0:
+        seconds = 0.0
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    if cs == 100:
+        s += 1
+        cs = 0
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def ass_color_from_hex(rrggbb: str) -> str:
+    # ASS wants &HAABBGGRR, use AA=00 (opaque)
     s = (rrggbb or "").strip().lstrip("#")
     if len(s) == 3:
         s = "".join([c * 2 for c in s])
@@ -118,23 +126,14 @@ def ass_hex_color(rrggbb: str) -> str:
     r = s[0:2]
     g = s[2:4]
     b = s[4:6]
-    return f"&H{b}{g}{r}"
+    return f"&H00{b}{g}{r}"
 
 
-def build_sub_style(primary_hex: str) -> str:
-    return (
-        f"Fontsize=10,"
-        f"PrimaryColour={ass_hex_color(primary_hex)},"
-        f"OutlineColour={ass_hex_color('000000')},"
-        f"Outline=3,"
-        f"Alignment=7,"
-        f"MarginL=20,"
-        f"MarginV=50"
-    )
-
-
-def esc_ff_filter(s: str) -> str:
-    return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+def ass_escape_text(t: str) -> str:
+    # Escape for ASS dialogue text
+    t = (t or "").replace("\n", " ").replace("\r", " ")
+    t = t.replace("{", r"\{").replace("}", r"\}")
+    return t
 
 
 class ProcessReq(BaseModel):
@@ -208,24 +207,64 @@ def process(req: ProcessReq):
 
         overlay.append({"slot": i + 1, "word": final_word, "time": float(chosen["start"])})
 
-    srt_path = os.path.join(work, "subtitles.srt")
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for idx, item in enumerate(overlay, start=1):
-            start = max(0.0, float(item["time"]))
-            if idx < len(overlay):
-                end = float(overlay[idx]["time"])
-            else:
-                end = duration
+    # Build ASS overlay:
+    # - Show "1.".."N." from start to end
+    # - At each word time, overlay "N. WORD" at the same position and keep it to end
+    ass_path = os.path.join(work, "overlay.ass")
 
-            end = min(end, start + 2.0)
-            if end - start < 0.7:
-                end = min(duration, start + 0.7)
+    primary = ass_color_from_hex(req.sub_primary_hex)
+    outline = ass_color_from_hex("000000")
 
-            f.write(f"{idx}\n")
-            f.write(f"{format_time(start)} --> {format_time(end)}\n")
-            f.write(f"{item['slot']}. {item['word']}\n\n")
+    # Layout. Tweak these for position/size.
+    x = 40
+    y0 = 90
+    line_gap = 42
+    font_size = 36
 
-    sub_style = build_sub_style(req.sub_primary_hex)
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("[Script Info]\n")
+        f.write("ScriptType: v4.00+\n")
+        f.write("PlayResX: 1080\n")
+        f.write("PlayResY: 1920\n")
+        f.write("WrapStyle: 2\n")
+        f.write("ScaledBorderAndShadow: yes\n\n")
+
+        f.write("[V4+ Styles]\n")
+        f.write(
+            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+            "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+            "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+        )
+
+        # Alignment=7 top-left, BorderStyle=1, Outline=3, Shadow=0
+        f.write(
+            "Style: Default,Arial,"
+            f"{font_size},{primary},{primary},{outline},&H00000000,"
+            "0,0,0,0,100,100,0,0,1,3,0,7,0,0,0,1\n\n"
+        )
+
+        f.write("[Events]\n")
+        f.write("Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n")
+
+        end_all = format_ass_time(duration)
+
+        # Base rows: numbers always visible
+        for i in range(int(req.slots)):
+            yy = y0 + i * line_gap
+            base_text = f"{{\\pos({x},{yy})}}{i+1}."
+            f.write(
+                f"Dialogue: 0,{format_ass_time(0.0)},{end_all},Default,,0,0,0,,{ass_escape_text(base_text)}\n"
+            )
+
+        # Word rows: appear at time and stay to end
+        for i, item in enumerate(overlay):
+            yy = y0 + i * line_gap
+            start_t = max(0.0, float(item["time"]))
+            start_ass = format_ass_time(start_t)
+            word_text = f"{{\\pos({x},{yy})}}{i+1}. {item['word']}"
+            f.write(
+                f"Dialogue: 1,{start_ass},{end_all},Default,,0,0,0,,{ass_escape_text(word_text)}\n"
+            )
 
     use_logo = False
     logo_path = os.path.join(work, "logo.png")
@@ -236,13 +275,13 @@ def process(req: ProcessReq):
     out_name = f"{req.output_prefix}{uuid.uuid4().hex}.mp4"
     out_path = os.path.join(work, out_name)
 
-    srt_f = esc_ff_filter(srt_path)
+    ass_f = esc_ff_filter(ass_path)
     logo_f = esc_ff_filter(logo_path)
 
     if use_logo:
         vf = (
             f"[0:v]fps={int(req.target_fps)},"
-            f"subtitles='{srt_f}':force_style='{sub_style}'[v];"
+            f"subtitles='{ass_f}'[v];"
             f"movie='{logo_f}',scale=200:-1[logo];"
             f"[v][logo]overlay=30:H-h-30:format=auto"
         )
@@ -260,7 +299,7 @@ def process(req: ProcessReq):
     else:
         vf = (
             f"fps={int(req.target_fps)},"
-            f"subtitles='{srt_f}':force_style='{sub_style}'"
+            f"subtitles='{ass_f}'"
         )
         cmd = [
             "ffmpeg", "-y",
